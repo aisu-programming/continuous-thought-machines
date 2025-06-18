@@ -212,3 +212,53 @@ def make_maze_gif(inputs, predictions, targets, attention_tracking, save_locatio
     fig.savefig(f'{save_location}/route_approximation.png', dpi=200)
     imageio.mimsave(f'{save_location}/prediction.gif', frames, fps=15, loop=100)
     plt.close(fig)
+
+
+def plot_gate_heatmaps(gate_tracking: np.ndarray,
+                       lengths: tuple[int, int, int],
+                       save_path: str):
+    """
+    Visualise gate_tracking as three heat‑maps (action, summary, out).
+
+    Parameters
+    ----------
+    gate_tracking : np.ndarray
+        Array with shape (T, B, D_total) **or** (T, D_total).
+        If batch dimension is present, the first batch item is visualised.
+    lengths : tuple (k_action, k_summary, k_out)
+        Lengths of the three gate segments along the last axis.
+    save_path : str
+        Folder to save 'gate_heatmaps.png'.
+    """
+    # ---- shape handling ----
+    T, B, D_total = gate_tracking.shape
+    assert sum(lengths) == D_total, \
+        f"lengths sum to {sum(lengths)} but gatetracking dim is {D_total}"
+    k_action, k_summary, k_out = lengths
+
+    # ---- plotting ----
+    def plot(heatmaps, filename):
+        fig, axes = plt.subplots(1, 3, figsize=(12, 8))  # , sharex=False, sharey=False)
+        titles = ["Action Gate", "Summary Gate", "Out Gate"]
+        for ax, data, title in zip(axes, heatmaps, titles):
+            im = ax.imshow(data,
+                           aspect="auto",
+                           interpolation="nearest",
+                           vmin=0.0,
+                           vmax=1.0,
+                           cmap="viridis")
+            ax.set_title(title, fontsize=16)
+        plt.colorbar(im, ax=axes[-1], orientation="vertical", fraction=0.015)
+        plt.tight_layout()
+        plt.savefig(f"{save_path}/{filename}.png", bbox_inches="tight", dpi=150)
+        plt.close(fig)
+
+    action_gate  = gate_tracking[:, 0, :k_action].T
+    summary_gate = gate_tracking[:, 0, k_action:k_action + k_summary].T
+    out_gate     = gate_tracking[:, 0, -k_out:].T
+    plot([action_gate, summary_gate, out_gate], "gate_heatmaps_batch-first")
+
+    action_gate  = gate_tracking.mean(0)[:, :k_action].T
+    summary_gate = gate_tracking.mean(0)[:, k_action:k_action + k_summary].T
+    out_gate     = gate_tracking.mean(0)[:, -k_out:].T
+    plot([action_gate, summary_gate, out_gate], "gate_heatmaps_batch-avg")

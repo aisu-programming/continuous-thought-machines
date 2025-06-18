@@ -13,7 +13,7 @@ from models.constants import (
     VALID_POSITIONAL_EMBEDDING_TYPES
 )
 
-class ContinuousThoughtMachine(nn.Module):
+class ContinuousThoughtMachinePrefrontalCortex(nn.Module):
     """
     Continuous Thought Machine (CTM).
 
@@ -42,7 +42,7 @@ class ContinuousThoughtMachine(nn.Module):
         d_input (int): Dimensionality of projected attention outputs or direct input features.
         heads (int): Number of attention heads.
         n_synch_out (int): Number of neurons used for output synchronisation (D_out, in paper).
-        n_synch_action (int): Number of neurons used for action/attention synchronisation (D_action, in paper).
+        n_synch_cortical_action (int): Number of neurons used for action/attention synchronisation (D_action, in paper).
         synapse_depth (int): Depth of the synapse model (U-Net if > 1, else MLP).
         memory_length (int): History length for Neuron-Level Models (M, in paper).
         deep_nlms (bool): Use deeper (2-layer) NLMs if True, else linear.
@@ -75,32 +75,37 @@ class ContinuousThoughtMachine(nn.Module):
                         NOTE: when using random-pairing, i-to-i (self) synchronisation is rare, meaning that 'recovering a
                         snapshot representation' (see paper) is difficult. This alleviates that. 
                         NOTE: works fine when set to 0.
-    """                               
+    """
 
     def __init__(self,
                  iterations,
                  d_model,
+                 d_pfc_model,
                  d_input,
                  heads,
+                 # batch_size,
+                 n_synch_cortical_action,
+                 n_synch_summary,
                  n_synch_out,
-                 n_synch_action,
                  synapse_depth,
+                 pfc_synapse_depth,
                  memory_length,
+                 pfc_memory_length,
                  deep_nlms,
                  memory_hidden_dims,
                  do_layernorm_nlm,
                  backbone_type,
                  positional_embedding_type,
+                 summary_dims,
                  out_dims,
+                 pfc_action_dims,
                  prediction_reshaper=[-1],
                  dropout=0,
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
-                 n_synch_action_choose=None,
-                 n_synch_out_choose=None,
                  ):
-        super(ContinuousThoughtMachine, self).__init__()
+        super(ContinuousThoughtMachinePrefrontalCortex, self).__init__()
 
         # --- Core Parameters ---
         self.iterations = iterations
@@ -108,10 +113,10 @@ class ContinuousThoughtMachine(nn.Module):
         self.d_input = d_input
         self.memory_length = memory_length
         self.prediction_reshaper = prediction_reshaper
+        self.n_synch_cortical_action = n_synch_cortical_action
+        self.n_synch_summary = n_synch_summary
         self.n_synch_out = n_synch_out
-        self.n_synch_action = n_synch_action
-        self.n_synch_action_choose = n_synch_action_choose
-        self.n_synch_out_choose = n_synch_out_choose
+        # self.batch_size = batch_size
         self.backbone_type = backbone_type
         self.out_dims = out_dims
         self.positional_embedding_type = positional_embedding_type
@@ -130,32 +135,44 @@ class ContinuousThoughtMachine(nn.Module):
         self.kv_proj = nn.Sequential(nn.LazyLinear(self.d_input), nn.LayerNorm(self.d_input)) if heads else None
         self.q_proj = nn.LazyLinear(self.d_input) if heads else None
         self.attention = nn.MultiheadAttention(self.d_input, heads, dropout, batch_first=True) if heads else None
-        
-        # --- Core CTM Modules ---
-        self.synapses = self.get_synapses(synapse_depth, d_model, dropout)
-        self.trace_processor = self.get_neuron_level_models(deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout_nlm)
 
-        #  --- Start States ---
-        self.register_parameter('start_activated_state', nn.Parameter(torch.zeros((d_model)).uniform_(-math.sqrt(1/(d_model)), math.sqrt(1/(d_model)))))
-        self.register_parameter('start_trace', nn.Parameter(torch.zeros((d_model, memory_length)).uniform_(-math.sqrt(1/(d_model+memory_length)), math.sqrt(1/(d_model+memory_length)))))
+        # --- Cortical CTM ---
+        self.cortical_synapse_model = self.get_synapses(synapse_depth, d_model, dropout)
+        self.cortical_neuron_level_model = self.get_neuron_level_models(deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout_nlm)
+        self.register_parameter('cortical_start_activated_state', nn.Parameter(torch.zeros((d_model)).uniform_(-math.sqrt(1/(d_model)), math.sqrt(1/(d_model)))))
+        self.register_parameter('cortical_start_trace', nn.Parameter(torch.zeros((d_model, memory_length)).uniform_(-math.sqrt(1/(d_model+memory_length)), math.sqrt(1/(d_model+memory_length)))))
+        self.synch_representation_size_cortical_action = self.calculate_synch_representation_size(n_synch_cortical_action)
+        self.synch_representation_size_summary         = self.calculate_synch_representation_size(n_synch_summary)
+        self.synch_representation_size_out             = self.calculate_synch_representation_size(n_synch_out)
+        for synch_type, size in [ ('cortical_action', self.synch_representation_size_cortical_action ),
+                                  ('summary',         self.synch_representation_size_summary         ),
+                                  ('out',             self.synch_representation_size_out             ) ]:
+            print(f"Cortical Synch representation size '{synch_type}': {size}")
+        self.set_synchronisation_parameters('cortical_action', n_synch_cortical_action, n_random_pairing_self)
+        self.set_synchronisation_parameters('summary',         n_synch_summary,         n_random_pairing_self)
+        self.set_synchronisation_parameters('out',             n_synch_out,             n_random_pairing_self)
+        self.summary_projector = nn.Sequential(nn.LazyLinear(summary_dims))
+        self.output_projector  = nn.Sequential(nn.LazyLinear(self.out_dims))
 
-        # --- Synchronisation ---
-        self.neuron_select_type_out, self.neuron_select_type_action = self.get_neuron_select_type()
-        self.synch_representation_size_action = self.calculate_synch_representation_size(self.n_synch_action)
-        self.synch_representation_size_out = self.calculate_synch_representation_size(self.n_synch_out)
-        if n_synch_action_choose is not None:
-            self.register_buffer("n_synch_action_choose_indices", torch.from_numpy(np.random.choice(np.arange(self.synch_representation_size_action), size=n_synch_action_choose)))
-        if n_synch_out_choose is not None:
-            self.register_buffer("n_synch_out_choose_indices", torch.from_numpy(np.random.choice(np.arange(self.synch_representation_size_out), size=n_synch_out_choose)))
-
-        for synch_type, size in (('action', self.synch_representation_size_action), ('out', self.synch_representation_size_out)):
-            print(f"Synch representation size {synch_type}: {size}")
-        if self.synch_representation_size_action:  # if not zero
-            self.set_synchronisation_parameters('action', self.n_synch_action, n_random_pairing_self)
-        self.set_synchronisation_parameters('out', self.n_synch_out, n_random_pairing_self)
-
-        # --- Output Procesing ---
-        self.output_projector = nn.Sequential(nn.LazyLinear(self.out_dims))
+        # --- PrefrontalCortex CTM ---
+        pfc_model = 'ctm'  # Currently only CTM is supported for PFC
+        if pfc_model == "ctm":
+            self.pfc_synapse_model = self.get_synapses(pfc_synapse_depth, d_pfc_model, dropout)
+            self.pfc_neuron_level_model = self.get_neuron_level_models(deep_nlms, do_layernorm_nlm, pfc_memory_length, memory_hidden_dims, d_pfc_model, dropout_nlm)
+            self.register_parameter('pfc_start_activated_state', nn.Parameter(torch.zeros((d_pfc_model)).uniform_(-math.sqrt(1/(d_pfc_model)), math.sqrt(1/(d_pfc_model)))))
+            self.register_parameter('pfc_start_trace', nn.Parameter(torch.zeros((d_pfc_model, pfc_memory_length)).uniform_(-math.sqrt(1/(d_pfc_model+pfc_memory_length)), math.sqrt(1/(d_pfc_model+pfc_memory_length)))))
+            n_synch_pfc = (d_pfc_model * (d_pfc_model + 1)) // 2
+            print(f"PrefrontalCortex Synch representation sizes: {n_synch_pfc}")
+            self.set_synchronisation_parameters('pfc_action', n_synch_pfc, n_random_pairing_self)
+            self.set_synchronisation_parameters('gate',       n_synch_pfc, n_random_pairing_self)
+            self.pfc_action_projector = nn.Sequential(nn.LazyLinear(pfc_action_dims))
+            self.gate_projector = nn.Sequential(nn.LazyLinear(
+                self.synch_representation_size_cortical_action +
+                self.synch_representation_size_summary +
+                self.synch_representation_size_out
+            ), nn.Sigmoid())
+        else:
+            raise NotImplementedError
 
     # --- Core CTM Methods ---
 
@@ -179,46 +196,46 @@ class ContinuousThoughtMachine(nn.Module):
         See Appendix TODO of the Technical Report (TODO:LINK) for the maths that enables this method.
         """
 
-        if synch_type == 'action': # Get action parameters
-            n_synch = self.n_synch_action
-            neuron_indices_left = self.action_neuron_indices_left
-            neuron_indices_right = self.action_neuron_indices_right
-        elif synch_type == 'out': # Get input parameters
-            n_synch = self.n_synch_out
-            neuron_indices_left = self.out_neuron_indices_left
-            neuron_indices_right = self.out_neuron_indices_right
-        
-        if self.neuron_select_type in ('first-last', 'random'):
-            # For first-last and random, we compute the pairwise sync between all selected neurons
-            if self.neuron_select_type == 'first-last':
-                if synch_type == 'action': # Use last n_synch neurons for action
-                    selected_left = selected_right = activated_state[:, -n_synch:]
-                elif synch_type == 'out': # Use first n_synch neurons for out
-                    selected_left = selected_right = activated_state[:, :n_synch]
-            else: # Use the randomly selected neurons
-                selected_left = activated_state[:, neuron_indices_left]
-                selected_right = activated_state[:, neuron_indices_right]
-            
+        if synch_type in ('cortical_action', 'summary', 'out'):
+
+            if synch_type == 'cortical_action':
+                neuron_indices_left  = self.cortical_action_neuron_indices_left
+                neuron_indices_right = self.cortical_action_neuron_indices_right
+            elif synch_type == 'summary':
+                neuron_indices_left  = self.summary_neuron_indices_left
+                neuron_indices_right = self.summary_neuron_indices_right
+            elif synch_type == 'out':
+                neuron_indices_left  = self.out_neuron_indices_left
+                neuron_indices_right = self.out_neuron_indices_right
+
+            if self.neuron_select_type in ('first-last', 'random'):
+                left  = activated_state[:, neuron_indices_left]
+                right = activated_state[:, neuron_indices_right]
+                outer = left.unsqueeze(2) * right.unsqueeze(1)
+                N = left.shape[1]
+                i, j = torch.triu_indices(N, N)
+                pairwise_product = outer[:, i, j]
+
+            else:
+                # B = activated_state.shape[0]
+                # K = neuron_indices_left.shape[1]
+                # batch_idx = torch.arange(B).unsqueeze(-1).expand(-1, K).to(activated_state.device)
+                # left  = activated_state[batch_idx, neuron_indices_left ]
+                # right = activated_state[batch_idx, neuron_indices_right]
+                left  = activated_state[:, neuron_indices_left]
+                right = activated_state[:, neuron_indices_right]
+                pairwise_product = left * right
+
+        elif synch_type in ('pfc_action', 'gate'):
+            N = activated_state.shape[1]
             # Compute outer product of selected neurons
-            outer = selected_left.unsqueeze(2) * selected_right.unsqueeze(1)
+            outer = activated_state.unsqueeze(2) * activated_state.unsqueeze(1)
             # Resulting matrix is symmetric, so we only need the upper triangle
-            i, j = torch.triu_indices(n_synch, n_synch)
+            i, j = torch.triu_indices(N, N)
             pairwise_product = outer[:, i, j]
 
-            if synch_type == 'action' and self.n_synch_action_choose is not None:
-                pairwise_product = pairwise_product[:, self.n_synch_action_choose_indices]
-            elif synch_type == 'out' and self.n_synch_out_choose is not None:
-                pairwise_product = pairwise_product[:, self.n_synch_out_choose_indices]
-            
-        elif self.neuron_select_type == 'random-pairing':
-            # For random-pairing, we compute the sync between specific pairs of neurons
-            left = activated_state[:, neuron_indices_left]
-            right = activated_state[:, neuron_indices_right]
-            pairwise_product = left * right
         else:
-            raise ValueError("Invalid neuron selection type")
-        
-        
+            raise ValueError(f"Invalid synch_type: {synch_type}")
         
         # Compute synchronisation recurrently
         if decay_alpha is None or decay_beta is None:
@@ -400,21 +417,25 @@ class ContinuousThoughtMachine(nn.Module):
             return SynapseUNET(d_model, synapse_depth, 16, dropout)  # hard-coded minimum width of 16; future work TODO.
 
     def set_synchronisation_parameters(self, synch_type: str, n_synch: int, n_random_pairing_self: int = 0):
-            """
-            1. Set the buffers for selecting neurons so that these indices are saved into the model state_dict.
-            2. Set the parameters for learnable exponential decay when computing synchronisation between all 
-                neurons.
-            """
-            assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
+        """
+        1. Set the buffers for selecting neurons so that these indices are saved into the model state_dict.
+        2. Set the parameters for learnable exponential decay when computing synchronisation between all neurons.
+        """
+        assert synch_type in ('cortical_action', 'summary', 'out', 'pfc_action', 'gate'), \
+            f"Invalid synch_type: {synch_type}"
+        if synch_type in ('cortical_action', 'summary', 'out'):
             left, right = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
-            # synch_representation_size = self.synch_representation_size_action if synch_type == 'action' else self.synch_representation_size_out
-            if synch_type == 'action':
-                synch_representation_size = self.synch_representation_size_action if self.n_synch_action_choose is None else self.n_synch_action_choose
-            else:
-                synch_representation_size = self.synch_representation_size_out if self.n_synch_out_choose is None else self.n_synch_out_choose
-            self.register_buffer(f'{synch_type}_neuron_indices_left', left)
+            self.register_buffer(f'{synch_type}_neuron_indices_left',  left)
             self.register_buffer(f'{synch_type}_neuron_indices_right', right)
-            self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
+        if synch_type == 'cortical_action':
+            synch_representation_size = self.synch_representation_size_cortical_action
+        elif synch_type == 'summary':
+            synch_representation_size = self.synch_representation_size_summary
+        elif synch_type == 'out':
+            synch_representation_size = self.synch_representation_size_out
+        else:
+            synch_representation_size = n_synch
+        self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
 
     def initialize_left_right_neurons(self, synch_type, d_model, n_synch, n_random_pairing_self=0):
         """
@@ -423,9 +444,11 @@ class ContinuousThoughtMachine(nn.Module):
         neuron selections are interesting to experiment with.
         """
         if self.neuron_select_type=='first-last':
-            if synch_type == 'out':
+            if synch_type == 'cortical_action':
                 neuron_indices_left = neuron_indices_right = torch.arange(0, n_synch)
-            elif synch_type == 'action':
+            if synch_type == 'summary':
+                neuron_indices_left = neuron_indices_right = torch.arange(self.n_synch_cortical_action, self.n_synch_cortical_action+n_synch)
+            elif synch_type == 'out':
                 neuron_indices_left = neuron_indices_right = torch.arange(d_model-n_synch, d_model)
 
         elif self.neuron_select_type=='random':
@@ -433,26 +456,15 @@ class ContinuousThoughtMachine(nn.Module):
             neuron_indices_right = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
 
         elif self.neuron_select_type=='random-pairing':
-            assert n_synch > n_random_pairing_self, f"Need at least {n_random_pairing_self} pairs for {self.neuron_select_type}"
+            assert n_synch > n_random_pairing_self, f"Need at least {n_random_pairing_self} pairs for random-pairing."
             neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
             neuron_indices_right = torch.concatenate((neuron_indices_left[:n_random_pairing_self], torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch-n_random_pairing_self))))
 
-        device = self.start_activated_state.device
-        return neuron_indices_left.to(device), neuron_indices_right.to(device)
+        # neuron_indices_left  = neuron_indices_left.unsqueeze(0).repeat(self.batch_size, 1)
+        # neuron_indices_right = neuron_indices_right.unsqueeze(0).repeat(self.batch_size, 1)
 
-    def get_neuron_select_type(self):
-        """
-        Another helper method to accomodate our legacy neuron selection types. 
-        TODO: additional experimentation and possible removal of 'first-last' and 'random'
-        """
-        print(f"Using neuron select type: {self.neuron_select_type}")
-        if self.neuron_select_type == 'first-last':
-            neuron_select_type_out, neuron_select_type_action = 'first', 'last'
-        elif self.neuron_select_type in ('random', 'random-pairing'):
-            neuron_select_type_out = neuron_select_type_action = self.neuron_select_type
-        else:
-            raise ValueError(f"Invalid neuron selection type: {self.neuron_select_type}")
-        return neuron_select_type_out, neuron_select_type_action
+        device = self.cortical_start_activated_state.device
+        return neuron_indices_left.to(device), neuron_indices_right.to(device)
 
     # --- Utilty Methods ---
 
@@ -471,9 +483,9 @@ class ContinuousThoughtMachine(nn.Module):
         assert self.positional_embedding_type in VALID_POSITIONAL_EMBEDDING_TYPES + ['none'], \
             f"Invalid positional_embedding_type: {self.positional_embedding_type}"
         
-        if self.neuron_select_type == 'first-last':
-            assert self.d_model >= (self.n_synch_out + self.n_synch_action), \
-                "d_model must be >= n_synch_out + n_synch_action for neuron subsets"
+        # if self.neuron_select_type == 'first-last':
+        #     assert self.d_model >= (self.n_synch_out + self.n_synch_cortical_action), \
+        #         "d_model must be >= n_synch_out + n_synch_cortical_action for neuron subsets"
 
         if self.backbone_type=='none' and self.positional_embedding_type!='none':
             raise AssertionError("There should be no positional embedding if there is no backbone.")
@@ -492,81 +504,122 @@ class ContinuousThoughtMachine(nn.Module):
 
 
 
-
     def forward(self, x, track=False):
         B = x.size(0)
         device = x.device
 
         # --- Tracking Initialization ---
-        pre_activations_tracking = []
-        post_activations_tracking = []
-        synch_out_tracking = []
-        synch_action_tracking = []
-        attention_tracking = []
+        cortical_pre_activations_tracking  = []
+        cortical_post_activations_tracking = []
+        # pfc_pre_activations_tracking       = []
+        # pfc_post_activations_tracking      = []
+        synch_action_tracking              = []
+        # synch_summary_tracking             = []
+        synch_out_tracking                 = []
+        # synch_pfc_action_tracking          = []
+        # synch_gate_tracking                = []
+        attention_tracking                 = []
+        gate_tracking                      = []
 
         # --- Featurise Input Data ---
         kv = self.compute_features(x)
 
         # --- Initialise Recurrent State ---
-        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, H, T)
-        activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1) # Shape: (B, H)
+        cortical_state_trace     = self.cortical_start_trace.unsqueeze(0).expand(B, -1, -1)          # Shape: (B, H, T)
+        cortical_activated_state = self.cortical_start_activated_state.unsqueeze(0).expand(B, -1)    # Shape: (B, H)
+        pfc_state_trace          = self.pfc_start_trace.unsqueeze(0).expand(B, -1, -1)
+        pfc_activated_state      = self.pfc_start_activated_state.unsqueeze(0).expand(B, -1)
 
         # --- Prepare Storage for Outputs per Iteration ---
         predictions = torch.empty(B, self.out_dims, self.iterations, device=device, dtype=torch.float32)
-        certainties = torch.empty(B, 2, self.iterations, device=device, dtype=torch.float32)
+        certainties = torch.empty(B, 2, self.iterations,             device=device, dtype=torch.float32)
 
         # --- Initialise Recurrent Synch Values  ---
-        decay_alpha_action, decay_beta_action = None, None
-        self.decay_params_action.data = torch.clamp(self.decay_params_action, 0, 15)  # Fix from github user: kuviki
-        self.decay_params_out.data = torch.clamp(self.decay_params_out, 0, 15)
-        r_action, r_out = torch.exp(-self.decay_params_action).unsqueeze(0).repeat(B, 1), torch.exp(-self.decay_params_out).unsqueeze(0).repeat(B, 1)
-
-        _, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, None, None, r_out, synch_type='out')
-        # Compute learned weighting for synchronisation
+        self.decay_params_cortical_action.data = torch.clamp(self.decay_params_cortical_action, 0, 15)
+        self.decay_params_summary.data         = torch.clamp(self.decay_params_summary,         0, 15)
+        self.decay_params_out.data             = torch.clamp(self.decay_params_out,             0, 15)
+        self.decay_params_pfc_action.data      = torch.clamp(self.decay_params_pfc_action,      0, 15)
+        self.decay_params_gate.data            = torch.clamp(self.decay_params_gate,            0, 15)
+        r_cortical_action = torch.exp(-self.decay_params_cortical_action).unsqueeze(0).repeat(B, 1)
+        r_summary         = torch.exp(-self.decay_params_summary        ).unsqueeze(0).repeat(B, 1)
+        r_out             = torch.exp(-self.decay_params_out            ).unsqueeze(0).repeat(B, 1)
+        r_pfc_action      = torch.exp(-self.decay_params_pfc_action     ).unsqueeze(0).repeat(B, 1)
+        r_gate            = torch.exp(-self.decay_params_gate           ).unsqueeze(0).repeat(B, 1)
+        decay_alpha_action,     decay_beta_action     = None, None
+        decay_alpha_summary,    decay_beta_summary    = None, None
+        decay_alpha_out,        decay_beta_out        = self.compute_synchronisation(cortical_activated_state, None, None, r_out, synch_type='out')[1:]
+        decay_alpha_pfc_action, decay_beta_pfc_action = None, None
+        decay_alpha_gate,       decay_beta_gate       = None, None
         
+        current_gate_action  = torch.ones((B, self.synch_representation_size_cortical_action), device=device)
+        current_gate_summary = torch.ones((B, self.synch_representation_size_summary),         device=device)
+        current_gate_out     = torch.ones((B, self.synch_representation_size_out),             device=device)
 
         # --- Recurrent Loop  ---
         for stepi in range(self.iterations):
 
             # --- Calculate Synchronisation for Input Data Interaction ---
-            synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
+            synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(cortical_activated_state, decay_alpha_action, decay_beta_action, r_cortical_action, synch_type='cortical_action')
+            synchronisation_action = synchronisation_action * current_gate_action
 
             # --- Interact with Data via Attention ---
             q = self.q_proj(synchronisation_action).unsqueeze(1)
             attn_out, attn_weights = self.attention(q, kv, kv, average_attn_weights=False, need_weights=True)
             attn_out = attn_out.squeeze(1)
-            pre_synapse_input = torch.concatenate((attn_out, activated_state), dim=-1)
+            cortical_pre_synapse_input = torch.concatenate((attn_out, cortical_activated_state), dim=-1)
 
-            # --- Apply Synapses ---
-            state = self.synapses(pre_synapse_input)
-            # The 'state_trace' is the history of incoming pre-activations
-            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+            # --- Apply Cortical Synapses ---
+            state = self.cortical_synapse_model(cortical_pre_synapse_input)
+            cortical_state_trace = torch.cat((cortical_state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
 
-            # --- Apply Neuron-Level Models ---
-            activated_state = self.trace_processor(state_trace)
-            # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
-            # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
-            # done using only the currect activated state (see compute_synchronisation method for explanation)
+            # --- Apply Cortical Neuron-Level Models ---
+            cortical_activated_state = self.cortical_neuron_level_model(cortical_state_trace)
 
             # --- Calculate Synchronisation for Output Predictions ---
-            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
+            synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(cortical_activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
+            synchronisation_out = synchronisation_out * current_gate_out
 
             # --- Get Predictions and Certainties ---
             current_prediction = self.output_projector(synchronisation_out)
-            current_certainty = self.compute_certainty(current_prediction)
+            current_certainty  = self.compute_certainty(current_prediction)
 
             predictions[..., stepi] = current_prediction
             certainties[..., stepi] = current_certainty
 
+            # --- Calculate Synchronisation for Summary ---
+            synchronisation_summary, decay_alpha_summary, decay_beta_summary = self.compute_synchronisation(cortical_activated_state, decay_alpha_summary, decay_beta_summary, r_summary, synch_type='summary')
+            synchronisation_summary = synchronisation_summary * current_gate_summary
+            current_summary = self.summary_projector(synchronisation_summary)
+
+            # --- Calculate Synchronisation for PFC action ---
+            synchronisation_pfc_action, decay_alpha_pfc_action, decay_beta_pfc_action = self.compute_synchronisation(pfc_activated_state, decay_alpha_pfc_action, decay_beta_pfc_action, r_pfc_action, synch_type='pfc_action')
+            current_pfc_action = self.pfc_action_projector(synchronisation_pfc_action)
+            
+            # --- Apply PFC Synapses ---
+            pfc_pre_synapse_input = torch.concatenate((current_summary, current_pfc_action, pfc_activated_state), dim=-1)
+            state = self.pfc_synapse_model(pfc_pre_synapse_input)
+            pfc_state_trace = torch.cat((pfc_state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+
+            # --- Apply PFC Neuron-Level Models ---
+            pfc_activated_state = self.pfc_neuron_level_model(pfc_state_trace)
+            synchronisation_gate, decay_alpha_gate, decay_beta_gate = self.compute_synchronisation(pfc_activated_state, decay_alpha_gate, decay_beta_gate, r_gate, synch_type='gate')
+            current_gate = self.gate_projector(synchronisation_gate)
+            current_gate_action, current_gate_summary, current_gate_out = torch.split(current_gate, [
+                self.synch_representation_size_cortical_action,
+                self.synch_representation_size_summary,
+                self.synch_representation_size_out
+            ], dim=-1)
+
             # --- Tracking ---
             if track:
-                pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
-                post_activations_tracking.append(activated_state.detach().cpu().numpy())
+                cortical_pre_activations_tracking.append(cortical_state_trace[:,:,-1].detach().cpu().numpy())
+                cortical_post_activations_tracking.append(cortical_activated_state.detach().cpu().numpy())
                 attention_tracking.append(attn_weights.detach().cpu().numpy())
                 synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
                 synch_action_tracking.append(synchronisation_action.detach().cpu().numpy())
+                gate_tracking.append(current_gate.detach().cpu().numpy())
 
         # --- Return Values ---
         if track:
-            return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
+            return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(cortical_pre_activations_tracking), np.array(cortical_post_activations_tracking), np.array(attention_tracking), np.array(gate_tracking)
         return predictions, certainties, synchronisation_out

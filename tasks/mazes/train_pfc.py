@@ -13,11 +13,10 @@ if torch.cuda.is_available():
 from tqdm.auto import tqdm
 
 from data.custom_datasets import MazeImageFolder
-from models.ctm import ContinuousThoughtMachine
 from models.ctm_pfc import ContinuousThoughtMachinePrefrontalCortex
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
-from tasks.mazes.plotting import make_maze_gif
+from tasks.mazes.plotting import make_maze_gif, plot_gate_heatmaps
 from tasks.image_classification.plotting import plot_neural_dynamics 
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import maze_loss 
@@ -57,7 +56,8 @@ def parse_args():
 
     # Model Architecture
     # Common across all or most
-    parser.add_argument('--d_model', type=int, default=512, help='Dimension of the model.')
+    parser.add_argument('--d_model', type=int, default=512, help='Dimension/Number of NLMs of the Cortical CTM.')
+    parser.add_argument('--d_pfc_model', type=int, default=32, help='Dimension/Number of NLMs of the PFC CTM.')
     parser.add_argument('--dropout', type=float, default=0.0, help='Dropout rate.')
     parser.add_argument('--backbone_type', type=str, default='resnet34-2', help='Type of backbone featureiser.') # Default changed from original script
     # CTM / LSTM specific
@@ -72,13 +72,16 @@ def parse_args():
 
     # CTM specific
     parser.add_argument('--synapse_depth', type=int, default=8, help='Depth of U-NET model for synapse. 1=linear, no unet (CTM only).') # Default changed
+    parser.add_argument('--pfc_synapse_depth', type=int, default=4)
+    parser.add_argument('--n_synch_cortical_action', type=int, default=32, help='Number of neurons to use for observation/action synch (CTM only).') # Default changed
+    parser.add_argument('--n_synch_summary', type=int, default=32)
     parser.add_argument('--n_synch_out', type=int, default=32, help='Number of neurons to use for output synch (CTM only).') # Default changed
-    parser.add_argument('--n_synch_action', type=int, default=32, help='Number of neurons to use for observation/action synch (CTM only).') # Default changed
+    parser.add_argument('--summary_dims', type=int, help='Dimensions of the summary vector (CTM only).')
+    parser.add_argument('--pfc_action_dims', type=int, help='Dimensions of the PFC action vector (CTM only).')
     parser.add_argument('--neuron_select_type', type=str, default='random-pairing', help='Protocol for selecting neuron subset (CTM only).')
     parser.add_argument('--n_random_pairing_self', type=int, default=0, help='Number of neurons paired self-to-self for synch (CTM only).')
-    parser.add_argument('--n_synch_action_choose', type=int, default=None)
-    parser.add_argument('--n_synch_out_choose', type=int, default=None)
     parser.add_argument('--memory_length', type=int, default=25, help='Length of the pre-activation history for NLMS (CTM only).')
+    parser.add_argument('--pfc_memory_length', type=int, default=50)
     parser.add_argument('--deep_memory', action=argparse.BooleanOptionalAction, default=True,
                         help='Use deep memory (CTM only).')
     parser.add_argument('--memory_hidden_dims', type=int, default=32, help='Hidden dimensions of the memory if using deep memory (CTM only).') # Default changed
@@ -167,28 +170,32 @@ if __name__=='__main__':
     # Build model conditionally
     model = None
     if args.model == 'ctm':
-        model = ContinuousThoughtMachine(
+        model = ContinuousThoughtMachinePrefrontalCortex(
             iterations=args.iterations,
             d_model=args.d_model,
+            d_pfc_model=args.d_pfc_model,
             d_input=args.d_input,
             heads=args.heads,
+            n_synch_cortical_action=args.n_synch_cortical_action,
+            n_synch_summary=args.n_synch_summary,
             n_synch_out=args.n_synch_out,
-            n_synch_action=args.n_synch_action,
             synapse_depth=args.synapse_depth,
+            pfc_synapse_depth=args.pfc_synapse_depth,
             memory_length=args.memory_length,
+            pfc_memory_length=args.pfc_memory_length,
             deep_nlms=args.deep_memory,
             memory_hidden_dims=args.memory_hidden_dims,
             do_layernorm_nlm=args.do_normalisation,
             backbone_type=args.backbone_type,
             positional_embedding_type=args.positional_embedding_type,
+            summary_dims=args.summary_dims,
             out_dims=args.out_dims,
+            pfc_action_dims=args.pfc_action_dims,
             prediction_reshaper=prediction_reshaper, 
             dropout=args.dropout,
             dropout_nlm=args.dropout_nlm,
             neuron_select_type=args.neuron_select_type,
             n_random_pairing_self=args.n_random_pairing_self,
-            n_synch_action_choose=args.n_synch_action_choose,
-            n_synch_out_choose=args.n_synch_out_choose,
         ).to(device)
     elif args.model == 'lstm':
          model = LSTMBaseline(
@@ -213,13 +220,13 @@ if __name__=='__main__':
     else:
         raise ValueError(f"Unknown model type: {args.model}")
 
-    try:
-        # Determine pseudo input shape based on dataset
-        h_w = 39 if args.dataset in ['mazes-small', 'mazes-medium'] else 99 # Example dimensions
-        pseudo_inputs = torch.zeros((1, 3, h_w, h_w), device=device).float()
-        model(pseudo_inputs)
-    except Exception as e:
-         print(f"Warning: Pseudo forward pass failed: {e}")
+    # try:
+    # Determine pseudo input shape based on dataset
+    h_w = 39 if args.dataset in ['mazes-small', 'mazes-medium'] else 99 # Example dimensions
+    pseudo_inputs = torch.zeros((1, 3, h_w, h_w), device=device).float()
+    model(pseudo_inputs)
+    # except Exception as e:
+    #     print(f"Warning: Pseudo forward pass failed: {e}")
 
     print(f'Total params: {sum(p.numel() for p in model.parameters())}')
 
@@ -343,7 +350,8 @@ if __name__=='__main__':
             model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True)
         # Compile synapses only for CTM
         if args.model == 'ctm':
-            model.synapses = torch.compile(model.synapses, mode='reduce-overhead', fullgraph=True)
+            model.cortical_synapse_model = torch.compile(model.cortical_synapse_model, mode='reduce-overhead', fullgraph=True)
+            model.pfc_synapse_model      = torch.compile(model.pfc_synapse_model,      mode='reduce-overhead', fullgraph=True)
 
     # Training
     iterator = iter(trainloader)
@@ -653,7 +661,7 @@ if __name__=='__main__':
                             longest_index = (targets_viz!=4).sum(-1).argmax() # Action 4 assumed padding/end
 
                             # Track internal states
-                            predictions_viz_raw, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
+                            predictions_viz_raw, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz, gate_tracking_viz = model(inputs_viz, track=True)
 
                             # Reshape predictions (assuming raw is B, D, T)
                             predictions_viz = predictions_viz_raw.reshape(predictions_viz_raw.size(0), -1, 5, predictions_viz_raw.size(-1)) # B, S, C, T
@@ -665,6 +673,12 @@ if __name__=='__main__':
 
                             # Plot dynamics (common plotting function)
                             plot_neural_dynamics(post_activations_viz, 100, args.log_dir, axis_snap=True)
+
+                            plot_gate_heatmaps(gate_tracking_viz, (
+                                model.synch_representation_size_cortical_action,
+                                model.synch_representation_size_summary,
+                                model.synch_representation_size_out
+                            ), args.log_dir)
 
                             # Create maze GIF (task-specific plotting)
                             make_maze_gif((inputs_viz[longest_index].detach().cpu().numpy()+1)/2,
